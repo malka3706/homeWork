@@ -2,50 +2,41 @@
 
 ## Tools Used
 
-- Claude (Anthropic) — implementation pair, code generation, debugging
+- Claude (Anthropic) — collaborative pair throughout the project
 
 ---
 
-## My Role
+## How I Used It
 
-I drove the architecture and owned all design decisions. Claude handled implementation speed — translating decisions into code, catching syntax issues, and running iterations. Every architectural choice in DECISIONS.md reflects my reasoning, not AI output.
+I used Claude as a collaborative tool across the entire project — architecture, implementation, debugging, and documentation. The process was iterative: Claude proposed approaches, I questioned them, we refined them together, and I made the final calls.
 
----
-
-## Key Architectural Decisions I Made
-
-**Retry via SCHEDULED state, not Redis re-enqueue**
-The natural first approach is to re-enqueue a failed job directly in Redis with a delayed score. I rejected this: if the worker crashes between the failure and the re-enqueue, the retry is silently lost. I designed the SCHEDULED state approach — write the retry intent to PostgreSQL first, promote via scheduler thread — so retries survive any crash. PostgreSQL is the source of truth, not Redis.
-
-**Two-layer idempotency**
-I identified that a DB unique constraint alone is not sufficient. A job can be cancelled via the API while its ID still sits in the Redis queue — the worker would dequeue and execute a cancelled job. I designed the second layer: the worker's status check before execution, making cancel-then-dequeue safe regardless of timing. I also identified that `ZREM` should be called on cancel to keep Redis clean, and that the status check must remain as a safety net even after adding `ZREM`.
-
-**Recovery timeout tradeoff**
-I understood and documented the double-execution risk in crash recovery — the 300s timeout reduces the window but cannot eliminate it. I chose to accept this tradeoff honestly rather than over-engineer a heartbeat solution within the assignment scope, and documented it explicitly in DECISIONS.md.
+I can explain every decision in this codebase. If something is in DECISIONS.md, I understood it before it was written.
 
 ---
 
-## Test Cases I Designed
+## Where I Was Actively Involved
 
-The core API tests were scaffolded. I owned the worker and edge-case tests — scenarios that required understanding the system's failure modes, not just its happy path:
+**Architecture and design**
+I didn't just accept the first suggestion. For example, when Claude initially proposed re-enqueuing failed jobs directly in Redis, I pushed back — if the worker crashes between the failure and the re-enqueue, the retry is silently lost. We iterated until we arrived at the SCHEDULED state approach, where the retry intent is written to PostgreSQL first and survives any crash.
 
-**`test_worker_skips_cancelled_job`**
-Claude's initial suggestion was to test duplicate enqueue as the idempotency scenario. I identified this was unrealistic — the actual race is a job cancelled via API while already sitting in Redis. I designed the correct scenario: enqueue, cancel in DB, worker dequeues and must skip. This test directly proves the cancel guard works against the real production race.
+Similarly, the two-layer idempotency design came from a conversation where I asked what happens if a job is cancelled while it's still in the Redis queue. That question led to the worker cancel guard — not something that was obvious from the start.
 
-**`test_worker_retries_on_failure` / `test_worker_permanent_failure_after_max_attempts`**
-I defined what needed to be asserted: not just that the job failed, but that `status=SCHEDULED` with a future `scheduled_at` proves the backoff mechanism, and that `status=FAILED` with `error_message` proves exhaustion. The distinction between these two tests proves the retry state machine works at both ends.
+**Test case design**
+The API tests were largely straightforward. The edge cases were mine:
 
-**`test_same_priority_fifo_ordering`**
-I asked whether equal-priority jobs are processed in insertion order — the timestamp tiebreaker in the score formula. Claude confirmed the theory; I insisted on a test that proves it with real Redis rather than trusting the formula.
+- `test_worker_skips_cancelled_job` — I identified that the realistic race isn't duplicate enqueue, it's cancel-then-dequeue. Claude's initial suggestion tested the wrong scenario. I defined the correct one: enqueue, cancel in DB, worker must skip.
+- `test_same_priority_fifo_ordering` — I asked whether equal-priority jobs respect insertion order. Claude confirmed the timestamp tiebreaker in the score formula handles it. I insisted on a test that proves it rather than trusting the math.
+- `test_concurrent_workers_no_duplicate_processing` — I asked how we prove BZPOPMIN atomicity under real load. We designed the test together: 3 threads × 10 jobs, `assert attempt_count == 1` for every job. The assertion is the proof, not the logs.
+- `test_priority_ordering_real_queue` — I asked for a test that proves priority ordering with real Redis, not a mock.
 
-**`test_concurrent_workers_no_duplicate_processing`**
-I drove the decision to implement a real concurrency test: 3 threads × 10 jobs, asserting `attempt_count == 1` for every job after all threads finish. The assertion — not the logs — is the proof. Logs show interleaving; `attempt_count == 1` proves BZPOPMIN atomicity held under concurrent load.
+**Trade-off awareness**
+I understood and accepted the trade-offs explicitly — double-execution risk in crash recovery, at-least-once delivery semantics, the ZREM gap that existed before I asked why cancelled jobs weren't removed from Redis immediately. These are documented in DECISIONS.md because I understood them, not just because Claude wrote them.
 
 ---
 
-## What AI Handled
+## What Claude Contributed
 
-- Translating architectural decisions into working Python code
-- Identifying bugs during implementation (enum `.value` in log formatting, wrong argument type in `ZREM` call, dead code in routes)
-- Writing test scaffolding once the scenario was defined
-- Structuring documentation once the decisions were made
+- Translating design decisions into working Python code
+- Catching implementation bugs (enum `.value` in logging, wrong type passed to `ZREM`, null-check ordering in cancel endpoint)
+- Suggesting the recovery monitor pattern and score formula, which I then questioned and validated
+- Writing documentation structure once the decisions were finalized
