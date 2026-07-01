@@ -1,21 +1,5 @@
 # Design Decisions
 
-## Race Condition Analysis
-
-| Scenario | What could go wrong | How it is handled | Status |
-|---|---|---|---|
-| Two requests submit with the same `idempotency_key` simultaneously | Both pass the pre-insert check before either commits — one gets an `IntegrityError` | `IntegrityError` is caught, DB is rolled back, the existing job is returned | ✅ Handled |
-| Job is cancelled via API while its ID still sits in the Redis queue | Worker dequeues the job_id, executes the handler on a cancelled job | Worker checks `status == PENDING` before executing — skips if `CANCELLED` | ✅ Handled |
-| Two workers call `BZPOPMIN` at the same instant | Both workers receive the same job_id and execute the handler twice | `BZPOPMIN` is atomic — only one caller receives each element, the other blocks | ✅ Handled (Redis guarantee) — verified by `test_concurrent_workers_no_duplicate_processing` |
-| User calls `cancel` while worker is mid-execution | Cancel succeeds, handler continues running in parallel | Worker sets `status=PROCESSING` before executing — `cancel_job` returns 409 for non-PENDING jobs | ✅ Handled |
-| Worker crashes after `BZPOPMIN` but before setting `PROCESSING` | Job is gone from Redis, DB still shows `PENDING` — job is lost | Recovery monitor finds `PROCESSING` jobs older than 300s and re-queues them. For the crash-before-claim case, the job remains `PENDING` and is picked up naturally | ✅ Handled |
-| Worker crashes mid-execution, recovery re-queues the job, original worker recovers | Job executes twice | 300s timeout is conservative to reduce this window — not fully eliminated. Heartbeat would solve this (see section 7) | ⚠️ Accepted trade-off |
-| `ZREM` fails during cancel, job_id stays in Redis | Worker dequeues a cancelled job and executes it | Worker cancel guard (status check) catches it regardless of whether `ZREM` succeeded | ✅ Handled |
-
----
-
-
-
 ## 1. Job Pickup Strategy
 
 **Approach chosen:** Redis Sorted Set + `BZPOPMIN`
@@ -202,3 +186,17 @@ discarded them — wasting worker wakeups and keeping the queue artificially
 large. We added `ZREM` during development after recognising this gap.
 The lesson: Redis and PostgreSQL state must be kept in sync on every
 state-changing operation, not just on the happy path.
+
+---
+
+## Race Condition Analysis
+
+| Scenario | What could go wrong | How it is handled | Status |
+|---|---|---|---|
+| Two requests submit with the same `idempotency_key` simultaneously | Both pass the pre-insert check before either commits — one gets an `IntegrityError` | `IntegrityError` is caught, DB is rolled back, the existing job is returned | ✅ Handled |
+| Job is cancelled via API while its ID still sits in the Redis queue | Worker dequeues the job_id, executes the handler on a cancelled job | Worker checks `status == PENDING` before executing — skips if `CANCELLED` | ✅ Handled |
+| Two workers call `BZPOPMIN` at the same instant | Both workers receive the same job_id and execute the handler twice | `BZPOPMIN` is atomic — only one caller receives each element, the other blocks | ✅ Handled (Redis guarantee) — verified by `test_concurrent_workers_no_duplicate_processing` |
+| User calls `cancel` while worker is mid-execution | Cancel succeeds, handler continues running in parallel | Worker sets `status=PROCESSING` before executing — `cancel_job` returns 409 for non-PENDING jobs | ✅ Handled |
+| Worker crashes after `BZPOPMIN` but before setting `PROCESSING` | Job is gone from Redis, DB still shows `PENDING` — job is lost | Recovery monitor finds `PROCESSING` jobs older than 300s and re-queues them. For the crash-before-claim case, the job remains `PENDING` and is picked up naturally | ✅ Handled |
+| Worker crashes mid-execution, recovery re-queues the job, original worker recovers | Job executes twice | 300s timeout is conservative to reduce this window — not fully eliminated. Heartbeat would solve this (see section 7) | ⚠️ Accepted trade-off |
+| `ZREM` fails during cancel, job_id stays in Redis | Worker dequeues a cancelled job and executes it | Worker cancel guard (status check) catches it regardless of whether `ZREM` succeeded | ✅ Handled |
