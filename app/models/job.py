@@ -30,10 +30,12 @@ class Job(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    job_type: Mapped[JobType] = mapped_column(SQLEnum(JobType), nullable=False)
+    job_type: Mapped[JobType] = mapped_column(
+        SQLEnum(JobType, values_callable=lambda x: [e.value for e in x]), nullable=False
+    )
 
     status: Mapped[JobStatus] = mapped_column(
-        SQLEnum(JobStatus),
+        SQLEnum(JobStatus, values_callable=lambda x: [e.value for e in x]),
         nullable=False,
         default=JobStatus.PENDING,
     )
