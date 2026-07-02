@@ -187,6 +187,16 @@ large. We added `ZREM` during development after recognising this gap.
 The lesson: Redis and PostgreSQL state must be kept in sync on every
 state-changing operation, not just on the happy path.
 
+**3. PENDING/Redis reconciliation sweep**
+Two crash windows can leave a job `PENDING` in PostgreSQL but absent from
+Redis: a worker dying between `BZPOPMIN` and the `PROCESSING` commit, or the
+API dying between committing the job and `enqueue_job`. Such a job is never
+picked up — no background process scans `PENDING` jobs. The fix is a periodic
+reconciliation sweep (similar to the existing scheduler/recovery threads) that
+re-enqueues `PENDING` jobs older than some threshold that are missing from the
+queue. `ZADD` on an existing member is a no-op for membership, so the sweep
+would be safe to run even against jobs that are already enqueued.
+
 ---
 
 ## Race Condition Analysis
@@ -196,7 +206,8 @@ state-changing operation, not just on the happy path.
 | Two requests submit with the same `idempotency_key` simultaneously | Both pass the pre-insert check before either commits — one gets an `IntegrityError` | `IntegrityError` is caught, DB is rolled back, the existing job is returned | ✅ Handled |
 | Job is cancelled via API while its ID still sits in the Redis queue | Worker dequeues the job_id, executes the handler on a cancelled job | Worker checks `status == PENDING` before executing — skips if `CANCELLED` | ✅ Handled |
 | Two workers call `BZPOPMIN` at the same instant | Both workers receive the same job_id and execute the handler twice | `BZPOPMIN` is atomic — only one caller receives each element, the other blocks | ✅ Handled (Redis guarantee) — verified by `test_concurrent_workers_no_duplicate_processing` |
-| User calls `cancel` while worker is mid-execution | Cancel succeeds, handler continues running in parallel | Worker sets `status=PROCESSING` before executing — `cancel_job` returns 409 for non-PENDING jobs | ✅ Handled |
-| Worker crashes after `BZPOPMIN` but before setting `PROCESSING` | Job is gone from Redis, DB still shows `PENDING` — job is lost | Recovery monitor finds `PROCESSING` jobs older than 300s and re-queues them. For the crash-before-claim case, the job remains `PENDING` and is picked up naturally | ✅ Handled |
+| User calls `cancel` while worker is mid-execution | Cancel succeeds, handler continues running in parallel | Handled in normal timing: the worker commits `PROCESSING` before executing, so `cancel_job` sees it and returns 409. A narrow window remains — there is no row locking (`SELECT FOR UPDATE`), so if cancel reads `PENDING` just before the worker commits `PROCESSING`, the cancel commits `CANCELLED`, the job still runs, and the final `COMPLETED` commit overwrites it | ⚠️ Narrow unlocked window |
+| Worker crashes after `BZPOPMIN` but before setting `PROCESSING` | Job is gone from Redis, DB still shows `PENDING` — nothing re-queues it. Workers only receive work from Redis, recovery only scans `PROCESSING`, the scheduler only scans `SCHEDULED` | Not automatically handled. The mitigation is operational: re-populate Redis from `PENDING` rows in PostgreSQL (see section 1). A periodic reconciliation sweep would close this gap (see section 7) | ⚠️ Known gap |
+| API crashes (or Redis is unavailable) between committing the job and `enqueue_job` | Job committed as `PENDING` but never enqueued — same stranded state as above | Same gap — operational re-population from PostgreSQL; a reconciliation sweep would close it | ⚠️ Known gap |
 | Worker crashes mid-execution, recovery re-queues the job, original worker recovers | Job executes twice | 300s timeout is conservative to reduce this window — not fully eliminated. Heartbeat would solve this (see section 7) | ⚠️ Accepted trade-off |
 | `ZREM` fails during cancel, job_id stays in Redis | Worker dequeues a cancelled job and executes it | Worker cancel guard (status check) catches it regardless of whether `ZREM` succeeded | ✅ Handled |

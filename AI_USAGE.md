@@ -1,42 +1,32 @@
 # AI Tool Usage
 
-## Tools Used
+## Tools I Used
 
-- Claude (Anthropic) — collaborative pair throughout the project
-
----
-
-## How I Used It
-
-I used Claude as a collaborative tool across the entire project — architecture, implementation, debugging, and documentation. The process was iterative: Claude proposed approaches, I questioned them, we refined them together, and I made the final calls.
-
-I can explain every decision in this codebase. If something is in DECISIONS.md, I understood it before it was written.
+- Claude (Anthropic) — used throughout the project: design discussions, implementation, debugging, and documentation. The process was iterative: I described the requirement, Claude proposed an approach or code, I reviewed and questioned it, and we refined it until I was satisfied. Final decisions were mine.
 
 ---
 
-## Where I Was Actively Involved
+## What Helped Most
 
-**Architecture and design**
-I didn't just accept the first suggestion. For example, when Claude initially proposed re-enqueuing failed jobs directly in Redis, I pushed back — if the worker crashes between the failure and the re-enqueue, the retry is silently lost. We iterated until we arrived at the SCHEDULED state approach, where the retry intent is written to PostgreSQL first and survives any crash.
+**1. Translating design decisions into working code**
+Once a decision was made (Redis sorted set as the queue, PostgreSQL as the source of truth, SCHEDULED state for retries), Claude produced the FastAPI routes, SQLAlchemy model, and worker loop quickly and mostly correctly. The priority score formula (`-priority * 1e9 + time.time()`) came from Claude; rather than trusting the math, I added tests that prove both priority ordering and FIFO ordering within the same priority (`test_priority_ordering_real_queue`, `test_same_priority_fifo_ordering`).
 
-Similarly, the two-layer idempotency design came from a conversation where I asked what happens if a job is cancelled while it's still in the Redis queue. That question led to the worker cancel guard — not something that was obvious from the start.
-
-**Test case design**
-The API tests were largely straightforward. The edge cases were mine:
-
-- `test_worker_skips_cancelled_job` — I identified that the realistic race isn't duplicate enqueue, it's cancel-then-dequeue. Claude's initial suggestion tested the wrong scenario. I defined the correct one: enqueue, cancel in DB, worker must skip.
-- `test_same_priority_fifo_ordering` — I asked whether equal-priority jobs respect insertion order. Claude confirmed the timestamp tiebreaker in the score formula handles it. I insisted on a test that proves it rather than trusting the math.
-- `test_concurrent_workers_no_duplicate_processing` — I asked how we prove BZPOPMIN atomicity under real load. We designed the test together: 3 threads × 10 jobs, `assert attempt_count == 1` for every job. The assertion is the proof, not the logs.
-- `test_priority_ordering_real_queue` — I asked for a test that proves priority ordering with real Redis, not a mock.
-
-**Trade-off awareness**
-I understood and accepted the trade-offs explicitly — double-execution risk in crash recovery, at-least-once delivery semantics, the ZREM gap that existed before I asked why cancelled jobs weren't removed from Redis immediately. These are documented in DECISIONS.md because I understood them, not just because Claude wrote them.
+**2. Catching small implementation bugs**
+Claude caught several bugs during review passes: an enum `.value` mistake in logging, the wrong type passed to `ZREM`, and null-check ordering in the cancel endpoint.
 
 ---
 
-## What Claude Contributed
+## What I Had to Fix
 
-- Translating design decisions into working Python code
-- Catching implementation bugs (enum `.value` in logging, wrong type passed to `ZREM`, null-check ordering in cancel endpoint)
-- Suggesting the recovery monitor pattern and score formula, which I then questioned and validated
-- Writing documentation structure once the decisions were finalized
+**1. Retry re-enqueue was not crash-safe (concurrency)**
+Claude's initial retry design had the worker re-enqueue a failed job directly into Redis. I asked what happens if the worker crashes between the failure and the re-enqueue — the answer is that the retry is silently lost. We changed the design: on failure the worker writes `SCHEDULED` + `scheduled_at` to PostgreSQL first, and a scheduler thread promotes due jobs back to the queue. The retry intent now survives a worker crash.
+
+**2. The cancellation test targeted the wrong race**
+Claude's first version of the cancellation test checked for duplicate enqueue. The realistic production race is different: a job is cancelled via the API while its ID is still sitting in the Redis queue, and a worker dequeues it afterwards. I redefined the test (`test_worker_skips_cancelled_job`): enqueue, cancel in the DB, run the worker, assert the handler never ran (`attempt_count == 0`). This also led to adding the worker-side status check as a guard.
+
+---
+
+## What AI Struggled With
+
+- **Crash-window analysis.** Claude was good at implementing a chosen recovery mechanism, but did not proactively surface crash windows (e.g., what happens if a process dies between two specific operations). Each of those scenarios only got analyzed when I asked about it directly, and its first answer sometimes presented a case as fully handled when a smaller residual window remained. I treated every "this is handled" claim as something to verify, not accept — the race condition table in DECISIONS.md is the result, including the trade-offs we knowingly accepted (e.g., possible double execution after timeout-based recovery).
+- **Knowing when to stop.** Left unchecked, Claude tended to add abstractions and options beyond what the assignment needed. Keeping the scope tight was my job, not the tool's.
