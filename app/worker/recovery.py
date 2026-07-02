@@ -37,19 +37,25 @@ def recover_stuck_jobs() -> None:
         if stuck_jobs:
             logger.warning("Found %s stuck job(s) — recovering", len(stuck_jobs))
 
+        to_enqueue = []
         for job in stuck_jobs:
             job.attempt_count += 1  # count the timed-out attempt before deciding
             if job.attempt_count < job.max_attempts:
                 job.status = JobStatus.PENDING
-                enqueue_job(job.id, job.priority)
-                logger.info("Re-queued stuck job_id=%s (attempt %s/%s)",
+                to_enqueue.append((job.id, job.priority))
+                logger.info("Re-queuing stuck job_id=%s (attempt %s/%s)",
                             job.id, job.attempt_count, job.max_attempts)
             else:
                 job.status = JobStatus.FAILED
                 job.error_message = "Job timed out after max attempts"
                 logger.warning("Permanently failed stuck job_id=%s", job.id)
 
+        # Commit BEFORE enqueueing — same ordering constraint as the scheduler:
+        # a live worker can dequeue the ID before an uncommitted PENDING is visible.
         db.commit()
+
+        for job_id, priority in to_enqueue:
+            enqueue_job(job_id, priority)
     finally:
         db.close()
 

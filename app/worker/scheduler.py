@@ -40,11 +40,18 @@ def promote_due_jobs() -> None:
         if due_jobs:
             logger.info("Promoting %s due scheduled job(s)", len(due_jobs))
 
+        to_enqueue = []
         for job in due_jobs:
             job.status = JobStatus.PENDING
-            enqueue_job(job.id, job.priority)
+            to_enqueue.append((job.id, job.priority))
 
+        # Commit BEFORE enqueueing: a worker blocked on BZPOPMIN reacts to ZADD
+        # within microseconds — if the PENDING commit hasn't landed yet it reads
+        # SCHEDULED, skips, and the job is stranded (PENDING in DB, gone from Redis).
         db.commit()
+
+        for job_id, priority in to_enqueue:
+            enqueue_job(job_id, priority)
     finally:
         db.close()
 
